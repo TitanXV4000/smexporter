@@ -71,10 +71,17 @@ var fileMoved = false;
 
   /* Initiate the Puppeteer browser */
   const browser = await puppeteer.launch({
-    // headless: false,
-    // slowMo: 250,
-    // defaultViewport: null,
-    args: ['--no-sandbox'], // necessary to work with puppeteer docker image
+    headless: true, // or false temporarily for visual debugging
+    args: [
+        '--no-sandbox', // Essential for Docker
+        '--disable-setuid-sandbox', 
+        '--single-process', 
+        '--no-zygote',
+        '--ignore-certificate-errors',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--window-size=1920,1080' // NEW: Adds a standard screen size to bypas
+    ],
+    // ... other options
   });
   logger.info("Browser loaded.");
 
@@ -88,6 +95,7 @@ var fileMoved = false;
   /* Go to the page and wait for it to load */
   await page.goto(config.SF_URL, { waitUntil: 'networkidle2' });
   logger.info("Salesforce initial auth page loaded.");
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/1-sf-initial-auth.jpg" });
 
   /* Click on the SSO button */
   await Promise.all([
@@ -97,17 +105,65 @@ var fileMoved = false;
     waitForNetworkIdle(page, 20000, 0),
     logger.info("Navigating to SSO page."),
   ]);
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/2a-navigate-to-sso.jpg" });
 
-  /* Enter username/password */
-  await Promise.all([
-    await page.type('#username', config.USER_LOGIN),
-    await page.type('#password', config.PASS),
-    await page.keyboard.press('Enter'),
-    logger.info("Logged in to Salesforce. Please wait..."),
-    await sleep(5000),
-    waitForNetworkIdle(page, 2000, 0),
-    logger.info("2FA selection page loaded."),
-  ]);
+  /* Enter username/password (AI) */
+  logger.info("Entering credentials and logging in to Salesforce.");
+  await page.type('#username', config.USER_LOGIN);
+  await page.type('#password', config.PASS);
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/2b-password-entered.jpg" });
+
+  // Wait for the navigation to the next page after hitting Enter.
+  //await Promise.all([
+  //  page.keyboard.press('Enter'),
+  //  page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 }), // Increased timeout to 60s
+  //  logger.info("Waiting for next page to load after login..."),
+  //]);
+
+  const navigationPromise = page.waitForNavigation({ 
+    waitUntil: 'domcontentloaded', // Use domcontentloaded for faster detection
+    timeout: 60000 
+  });
+  
+  // Click the Login button found in mf-login.txt
+  await page.click('input[name="submit"]');
+
+  // 2. Wait for the navigation to resolve
+  await navigationPromise;
+
+  logger.info("2FA selection page loaded.");
+
+  const frames = page.mainFrame().childFrames();
+  if (frames.length > 0) {
+    logger.warn(`Found ${frames.length} child frames. Content might be in an iframe.`);
+    frames.forEach((frame, index) => {
+      logger.warn(`Frame ${index + 1} URL: ${frame.url()}`);
+    });
+  } else {
+    logger.info("No child frames found on the main page.");
+  }
+
+  await sleep(1000); 
+
+  const currentUrl = page.url();
+  logger.info(`Current URL after navigation: ${currentUrl}`);
+  
+  // Wait for the body content to ensure DOM is ready for snapshot
+  // Using a long wait here to test for slow rendering
+  try {
+    await page.waitForSelector('body', { visible: true, timeout: 10000 }); 
+  } catch (e) {
+    logger.error("Body selector failed to become visible. Page is likely truly empty.");
+    // Continue with content check anyway
+  }
+
+  const pageContent = await page.content();
+  const contentSnippet = pageContent.substring(0, 500);
+  logger.info(`Page content snippet (first 500 chars): ${contentSnippet}`);
+  
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/3-2FA-selection.jpg" });
+
+
 
   /* Select 2FA TOTP and click enter */
   await Promise.all([
@@ -120,6 +176,7 @@ var fileMoved = false;
     //logger.info("Waiting for 2FA acceptance."),
     logger.info("2FA code page loaded"),
   ]);
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/4-2FA-code-page.jpg" });
 
   /* Read 2FA code */
   var code2FAnum = await readFile(config.DOWNLOAD_PATH + "/totp.txt");
@@ -130,11 +187,24 @@ var fileMoved = false;
   await Promise.all([
     await sleep(5000),
     await page.type('#nffc', code2FA),
-    await page.keyboard.press('Enter'),
-    logger.info("2FA code entered and submitted: " + code2FA),
+    /* await page.keyboard.press('Enter'), */
+    await page.keyboard.press('Tab'),
+    await page.keyboard.press('Space'),
+    logger.info("2FA code entered: " + code2FA),
     waitForNetworkIdle(page, 20000, 0),
     //logger.info("Waiting for 2FA acceptance."),
   ]);
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/5-2FA-code-entered.jpg" });
+
+  /* Enter 2FA code and submit */
+  await Promise.all([
+    await sleep(2000),
+    await page.keyboard.press('Enter'),
+    logger.info("2FA code submitted: " + code2FA),
+    waitForNetworkIdle(page, 20000, 0),
+    //logger.info("Waiting for 2FA acceptance."),
+  ]);
+  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/6-2FA-code-submitted.jpg" });
 
   logger.info("Report page loaded."),
 
