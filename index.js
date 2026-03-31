@@ -206,6 +206,49 @@ var fileMoved = false;
   ]);
   //await page.screenshot({ path: config.DOWNLOAD_PATH + "/6-2FA-code-submitted.jpg" });
 
+
+
+// Check if the "Verify Your Identity" page appeared
+const verificationNeeded = await page.evaluate(() => {
+    const h2 = document.querySelector('h2#header');
+    return h2 && h2.innerText.includes("Verify Your Identity");
+});
+
+if (verificationNeeded) {
+    logger.info("Device verification page detected. Reading totp-device.txt...");
+
+    // Wait for the VISIBLE text box, not the hidden token
+    await page.waitForSelector('input#tc', { visible: true, timeout: 15000 });
+
+    // Use your existing logic to read the code
+    const deviceCodeNum = await readFile(config.DOWNLOAD_PATH + "/totp-device.txt");
+    const deviceCodeArr = deviceCodeNum.toString().replace(/\r\n/g,'\n').split('\n');
+    const deviceCode = deviceCodeArr[0];
+
+    if (deviceCode) {
+        // Type the code into the Verification Code field 
+        await page.type('#tc', deviceCode, { delay: 100 });
+        logger.info("Device verification code entered: " + deviceCode);
+
+        // Click the 'Verify' submit button 
+        await Promise.all([
+            page.click('#save'),
+            waitForNetworkIdle(page, 20000, 0),
+        ]);
+
+        //await page.screenshot({ path: config.DOWNLOAD_PATH + "/7-device-verification-submitted.jpg" });
+        logger.info("Device verification complete.");
+    } else {
+        logger.error("totp-device.txt was found but appeared empty.");
+    }
+} else {
+    logger.info("Standard dashboard loaded; no device verification required.");
+}
+
+
+
+
+
   logger.info("Report page loaded."),
 
   /* Set download location */
