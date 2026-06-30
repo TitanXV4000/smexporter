@@ -1,11 +1,8 @@
-/* 
-sfexporter
-grabs an export of the specified report in csv format once per minute
-jwalker
+/* smexporter
+Grabs an export of the SMAX QMON view in CSV format at a specified interval
+Dynamic State-Machine Version (Persistent Browser Session)
 */
-var config = require('./config');
-var reportCount = 0;
-var refreshCount = -1;
+
 const puppeteer = require('puppeteer');
 const jwalkerLogger = require('tsanford-logger');
 const chokidar = require('chokidar');
@@ -14,419 +11,204 @@ const fsPromises = fs.promises;
 const path = require('path');
 
 const logger = jwalkerLogger.newLogger();
-logger.info("Starting up.");
+logger.info("Starting up SMAX Exporter with Persistent Browser Session.");
 
-var sleepTime = Math.floor(config.REPORT_INTERVAL / 1000);
-var sleepTimeUnit = "seconds";
-if (sleepTime > 60 ) { sleepTime = Math.floor(sleepTime / 60); sleepTimeUnit = "minutes"; }
-if (sleepTime > 60 ) { sleepTime = Math.floor(sleepTime / 60); sleepTimeUnit = "hours"; }
+// Configurations from Environment Variables
+const config = {
+    URL: process.env.SM_URL || 'https://us42-smax.saas.microfocus.com/saw/Requests?TENANTID=731633586',
+    DURATION: process.env.SM_DURATION || '2', 
+    USER_LOGIN: process.env.USER_LOGIN || 'tsanford@opentext.com',
+    PASS: process.env.PASS || 'Password',
+    DOWNLOAD_PATH: process.env.DOWNLOAD_PATH || '/smexports',
+    LOG_LEVEL: process.env.LOG_LEVEL || 'debug',
+    REPORT_TAG: process.env.REPORT_TAG || 'open',
+    REPORT_INTERVAL: parseInt(process.env.REPORT_INTERVAL || '60000', 10),
+    DOWNLOAD_TIMEOUT: parseInt(process.env.DOWNLOAD_TIMEOUT || '120000', 10)
+};
 
 const tempDownloadPath = `${config.DOWNLOAD_PATH}/${config.REPORT_TAG}`;
 
-//var downloading = false;
-var downloadFinished = false;
-var fileMoved = false;
-
-
-(async () => {
-  /* Create temp download directory */
-  try {
-    await makeTempDir();
-  } catch (e) {
-    logger.error(e);
-    logger.error('Error unrecoverable. Exiting...');
-    process.exit(5);
-  }
-
-  /* Create filesystem listener to watch download progress */
-  const watcher = chokidar.watch(tempDownloadPath, {ignored: /\.csv$/g, persistent: true});
-  watcher
-    .on('add', function(filePath)  {
-      logger.info('Download of file ' + filePath + ' has begun.');
-    })
-    //.on('change', function(filePath)  { logger.debug('File ' + filePath + ' has been changed.'); })
-    .on('unlink', async function(filePath)  {
-      let basename = path.basename(filePath, '.crdownload');
-      logger.debug('File has finished downloading: ' + basename);
-      downloadFinished = true;
-      
-      try {
-        await copyFile(`${tempDownloadPath}/${basename}`,
-                       `${tempDownloadPath}/${config.REPORT_TAG}_last.csv`);
-      } catch (e) {
-        logger.error(e);
-      }
-
-      try {
-        await moveFile(`${tempDownloadPath}/${basename}`,
-                       `${config.DOWNLOAD_PATH}/${config.REPORT_TAG}_${basename}`);
-      } catch (e) {
-        logger.error(e);
-        process.exit(5);
-      }
-    })
-    .on('error', function(error) { logger.error('Error happened: ' + error); });
-
-  try {
-
-  /* Initiate the Puppeteer browser */
-  const browser = await puppeteer.launch({
-    headless: true, // or false temporarily for visual debugging
-    args: [
-        '--no-sandbox', // Essential for Docker
-        '--disable-setuid-sandbox', 
-        '--single-process', 
-        '--no-zygote',
-        '--ignore-certificate-errors',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--window-size=1920,1080' // NEW: Adds a standard screen size to bypas
-    ],
-    // ... other options
-  });
-  logger.info("Browser loaded.");
-
-  const context = browser.defaultBrowserContext();
-  context.overridePermissions(config.SF_URL, ["notifications"]);
-
-  const page = await browser.newPage();
-  await page.setDefaultNavigationTimeout(60000);
-  logger.info("Blank page loaded.");
-
-  /* Go to the page and wait for it to load */
-  await page.goto(config.SF_URL, { waitUntil: 'networkidle2' });
-  logger.info("Salesforce initial auth page loaded.");
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/1-sf-initial-auth.jpg" });
-
-  /* Click on the SSO button */
-  await Promise.all([
-    await sleep(5000),
-    await page.click('#idp_section_buttons > button > span'),
-    await page.keyboard.press('Enter'),
-    waitForNetworkIdle(page, 20000, 0),
-    logger.info("Navigating to SSO page."),
-  ]);
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/2a-navigate-to-sso.jpg" });
-
-  /* Enter username/password (AI) */
-  logger.info("Entering credentials and logging in to Salesforce.");
-  await page.type('#username', config.USER_LOGIN);
-  await page.type('#password', config.PASS);
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/2b-password-entered.jpg" });
-
-  // Wait for the navigation to the next page after hitting Enter.
-  //await Promise.all([
-  //  page.keyboard.press('Enter'),
-  //  page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 }), // Increased timeout to 60s
-  //  logger.info("Waiting for next page to load after login..."),
-  //]);
-
-  const navigationPromise = page.waitForNavigation({ 
-    waitUntil: 'domcontentloaded', // Use domcontentloaded for faster detection
-    timeout: 60000 
-  });
-  
-  // Click the Login button found in mf-login.txt
-  await page.click('input[name="submit"]');
-
-  // 2. Wait for the navigation to resolve
-  await navigationPromise;
-
-  logger.info("2FA selection page loaded.");
-
-  const frames = page.mainFrame().childFrames();
-  if (frames.length > 0) {
-    logger.warn(`Found ${frames.length} child frames. Content might be in an iframe.`);
-    frames.forEach((frame, index) => {
-      logger.warn(`Frame ${index + 1} URL: ${frame.url()}`);
-    });
-  } else {
-    logger.info("No child frames found on the main page.");
-  }
-
-  await sleep(1000); 
-
-  const currentUrl = page.url();
-  logger.info(`Current URL after navigation: ${currentUrl}`);
-  
-  // Wait for the body content to ensure DOM is ready for snapshot
-  // Using a long wait here to test for slow rendering
-  try {
-    await page.waitForSelector('body', { visible: true, timeout: 10000 }); 
-  } catch (e) {
-    logger.error("Body selector failed to become visible. Page is likely truly empty.");
-    // Continue with content check anyway
-  }
-
-  const pageContent = await page.content();
-  const contentSnippet = pageContent.substring(0, 500);
-  logger.info(`Page content snippet (first 500 chars): ${contentSnippet}`);
-  
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/3-2FA-selection.jpg" });
-
-
-
-  /* Select 2FA TOTP and click enter */
-  await Promise.all([
-    await sleep(5000),
-    /* await page.keyboard.press('Tab'), */
-    await page.keyboard.press('ArrowDown'),
-    await page.keyboard.press('Tab'),
-    await page.keyboard.press('Enter'),
-    waitForNetworkIdle(page, 2000, 0),
-    //logger.info("Waiting for 2FA acceptance."),
-    logger.info("2FA code page loaded"),
-  ]);
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/4-2FA-code-page.jpg" });
-
-  /* Read 2FA code */
-  var code2FAnum = await readFile(config.DOWNLOAD_PATH + "/totp.txt");
-  var code2FAarr = code2FAnum.toString().replace(/\r\n/g,'\n').split('\n');
-  var code2FA = code2FAarr[0];
-
-  /* Enter 2FA code and submit */
-  await Promise.all([
-    await sleep(5000),
-    await page.type('#nffc', code2FA),
-    /* await page.keyboard.press('Enter'), */
-    await page.keyboard.press('Tab'),
-    await page.keyboard.press('Space'),
-    logger.info("2FA code entered: " + code2FA),
-    waitForNetworkIdle(page, 20000, 0),
-    //logger.info("Waiting for 2FA acceptance."),
-  ]);
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/5-2FA-code-entered.jpg" });
-
-  /* Enter 2FA code and submit */
-  await Promise.all([
-    await sleep(2000),
-    await page.keyboard.press('Enter'),
-    logger.info("2FA code submitted: " + code2FA),
-    waitForNetworkIdle(page, 20000, 0),
-    //logger.info("Waiting for 2FA acceptance."),
-  ]);
-  //await page.screenshot({ path: config.DOWNLOAD_PATH + "/6-2FA-code-submitted.jpg" });
-
-
-
-// Check if the "Verify Your Identity" page appeared
-const verificationNeeded = await page.evaluate(() => {
-    const h2 = document.querySelector('h2#header');
-    return h2 && h2.innerText.includes("Verify Your Identity");
-});
-
-if (verificationNeeded) {
-    logger.info("Device verification page detected. Reading totp-device.txt...");
-
-    // Wait for the VISIBLE text box, not the hidden token
-    await page.waitForSelector('input#tc', { visible: true, timeout: 15000 });
-
-    // Use your existing logic to read the code
-    const deviceCodeNum = await readFile(config.DOWNLOAD_PATH + "/totp-device.txt");
-    const deviceCodeArr = deviceCodeNum.toString().replace(/\r\n/g,'\n').split('\n');
-    const deviceCode = deviceCodeArr[0];
-
-    if (deviceCode) {
-        // Type the code into the Verification Code field 
-        await page.type('#tc', deviceCode, { delay: 100 });
-        logger.info("Device verification code entered: " + deviceCode);
-
-        // Click the 'Verify' submit button 
-        await Promise.all([
-            page.click('#save'),
-            waitForNetworkIdle(page, 20000, 0),
-        ]);
-
-        //await page.screenshot({ path: config.DOWNLOAD_PATH + "/7-device-verification-submitted.jpg" });
-        logger.info("Device verification complete.");
-    } else {
-        logger.error("totp-device.txt was found but appeared empty.");
-    }
-} else {
-    logger.info("Standard dashboard loaded; no device verification required.");
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-
-
-
-
-  logger.info("Report page loaded."),
-
-  /* Set download location */
-  await page._client.send('Page.setDownloadBehavior', {behavior: 'allow', downloadPath: tempDownloadPath});
-
-  /* Traverse the page with key presses to download the report */
-  var finished = false;
-  //try {
-    // Click the "Export Details" button. Only needs to happen once.
-    await page.evaluate(() => {
-      document.querySelector("#report > div.bFilterReport > div.reportActions > input:nth-child(8)")
-        .click();
-    });
-    logger.silly("Clicked \"Export Details\" button.");
-    await sleep(5000);
-
-    do {
-      refreshCount++;
-      if (refreshCount >= 1) {
-        logger.info("Reloading page. Count=" + refreshCount);
-        await page.reload();
-        refreshCount = 0;
-        logger.debug("Page reloaded. Count=" + refreshCount);
-      }
-
-      // Change report type to csv
-      await pressKey(page, 'Tab', 4);
-      await pressKey(page, 'ArrowUp');
-      logger.silly("Pressed [TAB TAB ARROWUP] keys.");
-      
-      // Click the "Export" button to begin download. 
-      // It seems to take around 20 seconds for the download to complete once the export button is clicked.
-      await page.evaluate(() => {
-        document.querySelector("#bottomButtonRow > input:nth-child(1)")
-          .click();
-      });
-      logger.silly("Clicked \"Export\" button.");
-
-      /* Verify file was downloaded */
-      logger.debug("Waiting for download to start...");
-      await waitForDownload(config.DOWNLOAD_TIMEOUT);
-
-      logger.info("Sleeping for " + sleepTime + " " + sleepTimeUnit + "... Count=" + reportCount);
-      await sleep (config.REPORT_INTERVAL);
-    } while (!finished);
-  } catch (err) {
-    if (refreshCount >= 3) { finished = true; }
-    //finished = true;
-    logger.error("C=" + refreshCount + " F=" + finished + " Error caught during export procedure: " + err);
-  } finally {
-    try {
-      if (browser !== null ) {
-        await browser.close();
-      }
-      logger.info("Browser closed. Exiting.");
-    } catch (err) {
-      logger.error("Error caught during browser.close(): " + err);
-    } finally {
-      process.exit();
-    }
-  }
-})();
-
-
-/* Works with the chokidar watcher to wait for the file download to complete */
-async function waitForDownload(timeout = 60000 /* ms */) {
-  var complete = false;
-  var elapsedTime = 0;
-  do {
-    if (downloadFinished && fileMoved) {
-      logger.debug("File download completed and moved to non-temp directory.");
-      downloadFinished = false;
-      fileMoved = false;
-      complete = true;
-      reportCount++;
-    } else {
-      if (elapsedTime >= timeout) throw new Error("Download timeout reached.");
-      logger.silly("Still waiting for download to complete. Time elapsed: " + elapsedTime / 1000 + " seconds.");
-      elapsedTime += 1000;
-      await sleep(1000);
-    }
-  } while (!complete);
-}
-
-
-/* Presses the key x times */
-async function pressKey(page, key, presses = 1) {
-  if (presses == 1) {
-    await page.keyboard.press(key);
-  } else {
-    for (var i = 0; i < presses; i++) {
-      await page.keyboard.press(key);
-      await sleep(200);
-    }
-  }
-}
-
 
 async function makeTempDir() {
-  try {
-    await fsPromises.mkdir(tempDownloadPath);
-  } catch (e) {
-    if (e.errno != -17) throw e; // -17 file already exists
-  }
+    try {
+        await fsPromises.mkdir(tempDownloadPath, { recursive: true });
+    } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+    }
 }
 
+async function runExporterLifecycle() {
+    await makeTempDir();
 
-async function moveFile(oldname, newname) {
-  logger.debug(`Moving file ${oldname} to ${newname}`);
-  try {
-    await fsPromises.rename(oldname, newname);
-    logger.debug('File move complete.');
-    fileMoved = true;
-  } catch (e) { 
-    logger.error('Throwing error from moveFile()');
-    throw e;
-  }
+    const browser = await puppeteer.launch({
+        headless: true,
+        // executablePath: '/usr/bin/chromium-browser', 
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1920,1080'
+        ]
+    });
+
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1920, height: 1080 });
+
+    // Configure persistent download directory behavior
+    const client = await page.target().createCDPSession();
+    await client.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: tempDownloadPath
+    });
+
+    logger.debug(`Initial navigation browser context to target URL: ${config.URL}`);
+    await page.goto(config.URL, { waitUntil: 'Infinity' });
+
+    let runCount = 0;
+
+    // Endless execution cycle that keeps the same browser instance open
+    while (true) {
+        runCount++;
+        logger.info(`--- Starting Extraction Loop Cycle #${runCount} ---`);
+        let downloadTriggeredForThisCycle = false;
+        let stateAttempts = 0;
+        const maxStateAttempts = 20; 
+
+        // State Machine Evaluator
+        while (!downloadTriggeredForThisCycle && stateAttempts < maxStateAttempts) {
+            stateAttempts++;
+            const currentUrl = page.url();
+            logger.debug(`Evaluating State (Attempt ${stateAttempts}) | URL: ${currentUrl}`);
+
+            // -------------------------------------------------------------------------
+            // STATE 1: Initial Identity Portal Gateway (Username Entry Screen)
+            // -------------------------------------------------------------------------
+            if (await page.$('#Ecom_User_ID') && await page.$('#loginButton2')) {
+                logger.info("State Detected: Initial Identity Portal Gateway. Inputting username...");
+                await page.type('#Ecom_User_ID', config.USER_LOGIN);
+                await page.click('#loginButton2');
+                await sleep(4000); 
+                continue;
+            }
+
+            // -------------------------------------------------------------------------
+            // STATE 2: Employee Sign-In Portal (Username + Password Form Screen)
+            // -------------------------------------------------------------------------
+            if (await page.$('input[name="Ecom_Password"]') || await page.$('#password')) {
+                logger.info("State Detected: OpenText Employee Credential Challenge Form.");
+                
+                const userField = await page.$('#username') || await page.$('input[name="Ecom_User_ID"]');
+                if (userField) {
+                    await page.$eval('#username', el => el.value = '').catch(() => {});
+                    await page.type('#username', config.USER_LOGIN).catch(() => {});
+                }
+
+                const passSelector = (await page.$('#password')) ? '#password' : 'input[name="Ecom_Password"]';
+                await page.type(passSelector, config.PASS);
+                
+                logger.info("Submitting employee authentication challenge credentials...");
+                const submitButton = await page.$('input[type="submit"]') || await page.$('#loginButton2');
+                await submitButton.click();
+                await sleep(6000); 
+                continue;
+            }
+
+            // -------------------------------------------------------------------------
+            // STATE 3: SMAX Core Loaded - Searching/Navigating to QMON View
+            // -------------------------------------------------------------------------
+            const qmonSelector = '[data-m-id*="QMON"], [title*="QMON"], .sm-sidebar-item'; 
+            if (currentUrl.includes('/saw/') && await page.$(qmonSelector)) {
+                logger.info("State Detected: SMAX Core Layout Active. Attempting QMON View click...");
+                
+                const targetClicked = await page.evaluate(() => {
+                    const elements = Array.from(document.querySelectorAll('.sm-sidebar-item, [role="treeitem"], span, a'));
+                    const qmonNode = elements.find(el => el.textContent && el.textContent.includes('QMON'));
+                    if (qmonNode) {
+                        qmonNode.click();
+                        return true;
+                    }
+                    return false;
+                });
+
+                if (targetClicked) {
+                    logger.info("Successfully targeted the QMON UI view element. Awaiting grid assembly...");
+                    await sleep(6000); 
+                }
+                continue;
+            }
+
+            // -------------------------------------------------------------------------
+            // STATE 4: Target Grid Populated - Ready for CSV Export Interaction
+            // -------------------------------------------------------------------------
+            const exportSelector = 'button[title*="CSV"], button[title*="Export"], .grid-export-btn, [data-action*="export"]';
+            if (currentUrl.includes('/saw/Requests') && await page.$(exportSelector)) {
+                logger.info("State Detected: Active QMON Report Grid Visible. Triggering CSV download stream...");
+                
+                await page.click(exportSelector);
+                logger.info("Export button successfully clicked.");
+                
+                downloadTriggeredForThisCycle = true; 
+                break;
+            }
+
+            // Transient State Fallback
+            logger.debug("State Undetermined/Transient. Waiting for interface framework stability...");
+            await sleep(2500);
+        }
+
+        // Give the file system time to capture and settle the download before refreshing
+        await sleep(5000);
+
+        if (process.env.RUN_ONCE === 'true') {
+            logger.info("RUN_ONCE configuration flag detected. Shuts down browser contexts.");
+            break;
+        }
+
+        // Execution Sleep Gap: Keep browser completely open, idling right here
+        logger.info(`Cycle complete. Browser remaining active. Sleeping for interval gap: ${config.REPORT_INTERVAL}ms`);
+        await sleep(config.REPORT_INTERVAL);
+
+        // -------------------------------------------------------------------------
+        // POST-INTERVAL REFRESH ACTION
+        // This drops us back to State 3 or 4 instantly without losing session cookies!
+        // -------------------------------------------------------------------------
+        logger.info("Interval complete. Refreshing browser viewport cache for next run execution...");
+        await page.reload({ waitUntil: 'Infinity' }).catch(err => logger.error(`Page reload error caught: ${err.message}`));
+    }
+
+    await browser.close();
+    process.exit(0);
 }
 
+// File Watcher Component (Renames file instantly to capture the dynamic SM_DURATION property)
+async function initFileWatcher() {
+    const watcher = chokidar.watch(tempDownloadPath, { ignored: /\\.csv$/g, persistent: true });
+    
+    watcher.on('add', async function(filePath) {
+        if (filePath.endsWith('.crdownload') || filePath.endsWith('.tmp')) return;
 
-async function copyFile(oldname, newname) {
-  logger.debug(`Copying file ${oldname} to ${newname}`);
-  try {
-    await fsPromises.copyFile(oldname, newname);
-    logger.debug('File copy complete.');
-    fileCopied = true;
-  } catch (e) { 
-    logger.error('Throwing error from copyFile()');
-    throw e;
-  }
+        logger.info(`File download event intercepted: ${filePath}`);
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const finalName = `smax_report_${config.DURATION}d_${config.REPORT_TAG}_${timestamp}.csv`;
+        const destPath = path.join(config.DOWNLOAD_PATH, finalName);
+
+        try {
+            logger.info(`Preserving copy file stream directly to target volume: ${destPath}`);
+            await fsPromises.copyFile(filePath, destPath);
+            await fsPromises.unlink(filePath); 
+            logger.info("File system rename operations executed cleanly.");
+        } catch (err) {
+            logger.error(`Failed renaming operations on targeted output path: ${err.message}`);
+        }
+    });
 }
 
-async function readFile(path) {
-  try {
-    return fs.readFileSync(path);
-  } catch (e) {
-    logger.error("Error caught in readFile: " + e.toLocaleString());
-  }t
-}
-
-/* Use if 500ms timeout of 'networkidleX' is insufficient */
-function waitForNetworkIdle(page, timeout, maxInflightRequests = 0) {
-  page.on('request', onRequestStarted);
-  page.on('requestfinished', onRequestFinished);
-  page.on('requestfailed', onRequestFinished);
-
-  let inflight = 0;
-  let fulfill;
-  let promise = new Promise(x => fulfill = x);
-  let timeoutId = setTimeout(onTimeoutDone, timeout);
-  return promise;
-
-  function onTimeoutDone() {
-    page.removeListener('request', onRequestStarted);
-    page.removeListener('requestfinished', onRequestFinished);
-    page.removeListener('requestfailed', onRequestFinished);
-    fulfill();
-  }
-
-  function onRequestStarted() {
-    ++inflight;
-    if (inflight > maxInflightRequests)
-      clearTimeout(timeoutId);
-  }
-  
-  function onRequestFinished() {
-    if (inflight === 0)
-      return;
-    --inflight;
-    if (inflight === maxInflightRequests)
-      timeoutId = setTimeout(onTimeoutDone, timeout);
-  }
-}
-
-
-/* They promised me this would not be needed... */
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-} 
+// Application Lifecycle Core Launcher
+(async () => {
+    await initFileWatcher();
+    await runExporterLifecycle();
+})();
