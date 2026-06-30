@@ -12,9 +12,9 @@ RUN apt-get install -y wget gnupg && \
 RUN apt-get update -o Acquire::Check-Valid-Until=false
 RUN apt-get -y install git
 RUN apt-get -y install vim
-RUN mkdir /sfexports
-RUN git clone https://github.com/TitanXV4000/sfexporter.git
-WORKDIR /usr/src/apps/sfexporter
+RUN mkdir /smexports
+RUN git clone https://github.com/TitanXV4000/smexporter.git
+WORKDIR /usr/src/apps/smexporter
 RUN npm install
 # If you are building your code for production
 # RUN npm ci --only=production
