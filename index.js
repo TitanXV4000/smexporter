@@ -84,7 +84,7 @@ async function runExporterLifecycle() {
             logger.debug(`Evaluating State (Attempt ${stateAttempts}) | URL: ${currentUrl}`);
             
             // Save step screenshots sequentially by layout attempt inside the run cycle
-            await page.screenshot({ path: `/smexports/debug-run${runCount}-state${stateAttempts}.png`, fullPage: true }).catch(err => {});
+            //await page.screenshot({ path: `/smexports/debug-run${runCount}-state${stateAttempts}.png`, fullPage: true }).catch(err => {});
 
             // -------------------------------------------------------------------------
             // STATE 1: Initial Identity Portal Gateway (Username Entry Screen)
