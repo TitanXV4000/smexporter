@@ -44,13 +44,21 @@ async function runExporterLifecycle() {
     await makeTempDir();
 
     const browser = await puppeteer.launch({
-        headless: true,
-        // executablePath: '/usr/bin/chromium-browser', 
+        headless: false,
+        //executablePath: '/usr/bin/chromium-browser', 
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--window-size=1920,1080'
+            //'--no-sandbox', // Essential for Docker
+            //'--disable-setuid-sandbox',
+            //'--single-process',
+            //'--no-zygote',
+            //'--ignore-certificate-errors',
+            //'--disable-features=IsolateOrigins,site-per-process',
+            //'--window-size=1920,1080' // NEW: Adds a standard screen size to bypas
+
         ]
     });
 
@@ -65,7 +73,7 @@ async function runExporterLifecycle() {
     });
 
     logger.debug(`Initial navigation browser context to target URL: ${config.URL}`);
-    await page.goto(config.URL, { waitUntil: 'Infinity' });
+    await page.goto(config.URL, { waitUntil: 'networkidle2', timeout: 0 });
 
     let runCount = 0;
 
@@ -82,6 +90,7 @@ async function runExporterLifecycle() {
             stateAttempts++;
             const currentUrl = page.url();
             logger.debug(`Evaluating State (Attempt ${stateAttempts}) | URL: ${currentUrl}`);
+            await page.screenshot({ path: `/smexports/debug-state${runCount}.png`, fullPage: true }).catch(err => {});
 
             // -------------------------------------------------------------------------
             // STATE 1: Initial Identity Portal Gateway (Username Entry Screen)
@@ -91,6 +100,7 @@ async function runExporterLifecycle() {
                 await page.type('#Ecom_User_ID', config.USER_LOGIN);
                 await page.click('#loginButton2');
                 await sleep(4000); 
+                //await page.screenshot({ path: '/smexports/debug-state1.png', fullPage: true }).catch(err => {});
                 continue;
             }
 
@@ -113,6 +123,7 @@ async function runExporterLifecycle() {
                 const submitButton = await page.$('input[type="submit"]') || await page.$('#loginButton2');
                 await submitButton.click();
                 await sleep(6000); 
+                //await page.screenshot({ path: '/smexports/debug-state2.png', fullPage: true }).catch(err => {});
                 continue;
             }
 
@@ -121,37 +132,116 @@ async function runExporterLifecycle() {
             // -------------------------------------------------------------------------
             const qmonSelector = '[data-m-id*="QMON"], [title*="QMON"], .sm-sidebar-item'; 
             if (currentUrl.includes('/saw/') && await page.$(qmonSelector)) {
-                logger.info("State Detected: SMAX Core Layout Active. Attempting QMON View click...");
                 
-                const targetClicked = await page.evaluate(() => {
-                    const elements = Array.from(document.querySelectorAll('.sm-sidebar-item, [role="treeitem"], span, a'));
-                    const qmonNode = elements.find(el => el.textContent && el.textContent.includes('QMON'));
-                    if (qmonNode) {
-                        qmonNode.click();
-                        return true;
-                    }
-                    return false;
+                // Check if QMON is already selected/active on the screen
+                const isQmonAlreadyActive = await page.evaluate(() => {
+                    const activeFilter = document.querySelector('.ess-filter-favorite-item-selected');
+                    if (activeFilter && activeFilter.textContent.includes('QMON')) return true;
+                    
+                    const activeElements = Array.from(document.querySelectorAll('.active, .selected'));
+                    return activeElements.some(el => (el.textContent || '').trim() === 'QMON');
                 });
 
-                if (targetClicked) {
-                    logger.info("Successfully targeted the QMON UI view element. Awaiting grid assembly...");
-                    await sleep(6000); 
+                if (!isQmonAlreadyActive) {
+                    logger.info("State Detected: SMAX Core Layout Active. Attempting QMON View click...");
+                    
+                    const targetClicked = await page.evaluate(() => {
+                        const elements = Array.from(document.querySelectorAll('.sm-sidebar-item, [role="treeitem"], span, a'));
+                        const qmonNode = elements.find(el => el.textContent && el.textContent.includes('QMON'));
+                        if (qmonNode) {
+                            qmonNode.click();
+                            return true;
+                        }
+                        return false;
+                    });
+
+                    if (targetClicked) {
+                        logger.info("Successfully targeted the QMON UI view element. Awaiting grid assembly...");
+                        await sleep(6000); 
+                        //await page.screenshot({ path: '/smexports/debug-click.png', fullPage: true }).catch(err => {});
+                        continue;
+                    }
+                } else {
+                    logger.debug("QMON view is already selected. Skipping click sequence.");
                 }
-                continue;
             }
+            //await page.screenshot({ path: '/smexports/debug-state3.png', fullPage: true }).catch(err => {});
 
             // -------------------------------------------------------------------------
             // STATE 4: Target Grid Populated - Ready for CSV Export Interaction
             // -------------------------------------------------------------------------
-            const exportSelector = 'button[title*="CSV"], button[title*="Export"], .grid-export-btn, [data-action*="export"]';
-            if (currentUrl.includes('/saw/Requests') && await page.$(exportSelector)) {
-                logger.info("State Detected: Active QMON Report Grid Visible. Triggering CSV download stream...");
+            if (currentUrl.toLowerCase().includes('/saw/requests')) {
                 
-                await page.click(exportSelector);
-                logger.info("Export button successfully clicked.");
-                
-                downloadTriggeredForThisCycle = true; 
-                break;
+                // 1. Verify the "More" button is visually active and click it
+                const moreBtnStatus = await page.evaluate(() => {
+                    const buttons = Array.from(document.querySelectorAll('button, .ess-btn, .grid-header-button'));
+                    const target = buttons.find(b => (b.textContent || '').trim() === 'More');
+                    
+                    if (target) {
+                        const styles = window.getComputedStyle(target);
+                        if (parseFloat(styles.opacity) < 0.8 || styles.pointerEvents === 'none' || target.hasAttribute('disabled')) {
+                            return 'DISABLED'; 
+                        }
+                        target.click();
+                        return 'CLICKED';
+                    }
+                    return 'NOT_FOUND';
+                });
+
+                if (moreBtnStatus === 'CLICKED') {
+                    logger.info("State Detected: Active QMON Report Grid Ready. Action menu expanded.");
+                    
+                    // 2. Pause to allow the framework to render the dropdown overlay container
+                    await sleep(2000);
+
+                    // 3. Arrow down through the list until the "Export to CSV" row is highlighted
+                    let csvHighlighted = false;
+                    let navAttempts = 0;
+                    const maxNavAttempts = 10;
+
+                    while (!csvHighlighted && navAttempts < maxNavAttempts) {
+                        navAttempts++;
+                        logger.debug(`Keyboard Navigation: Sending ArrowDown stroke (Attempt ${navAttempts})...`);
+                        await page.keyboard.press('ArrowDown');
+                        await sleep(400); // Small pause for the focus style to render
+
+                        // Check the active/focused DOM element text
+                        csvHighlighted = await page.evaluate(() => {
+                            const activeEl = document.activeElement;
+                            if (!activeEl) return false;
+
+                            // Check active element text, or look for sub-spans inside the active menu container
+                            const elementText = (activeEl.textContent || '').trim();
+                            
+                            // SMAX often drops focus onto a container or list item wrapper
+                            const hasExportText = elementText.toLowerCase().includes('export to csv') || elementText === 'CSV';
+                            
+                            // Double-check if the active element has a native 'focused' or 'active' menu class
+                            const isFocusedMenuRow = activeEl.classList.contains('x-menu-item-active') || 
+                                                     activeEl.classList.contains('focused') || 
+                                                     !!activeEl.querySelector('.focused, .x-menu-item-active');
+
+                            return hasExportText;
+                        });
+                    }
+
+                    if (csvHighlighted) {
+                        logger.info("Export to CSV option successfully highlighted! Pressing Enter key...");
+                        await page.keyboard.press('Enter');
+                        
+                        logger.info("Enter key sent. Waiting for file generation stream...");
+                        downloadTriggeredForThisCycle = true;
+                        
+                        // 4. Sleep to let Chrome complete the file stream write before breaking the cycle
+                        await sleep(10000);
+                        break;
+                    } else {
+                        logger.warn("Cycled through ArrowDown navigation steps but 'Export to CSV' highlight state was never captured.");
+                        await page.screenshot({ path: `/smexports/debug-menu-failed-state${stateAttempts}.png`, fullPage: true }).catch(() => {});
+                    }
+                } else if (moreBtnStatus === 'DISABLED') {
+                    logger.debug("Found 'More' button, but it is visually faded/disabled by SMAX. Waiting for grid stability...");
+                }
             }
 
             // Transient State Fallback
@@ -176,7 +266,7 @@ async function runExporterLifecycle() {
         // This drops us back to State 3 or 4 instantly without losing session cookies!
         // -------------------------------------------------------------------------
         logger.info("Interval complete. Refreshing browser viewport cache for next run execution...");
-        await page.reload({ waitUntil: 'Infinity' }).catch(err => logger.error(`Page reload error caught: ${err.message}`));
+        await page.reload({ waitUntil: 'networkidle2', timeout: 0 }).catch(err => logger.error(`Page reload error caught: ${err.message}`));
     }
 
     await browser.close();
