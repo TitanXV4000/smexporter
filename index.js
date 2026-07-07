@@ -44,7 +44,7 @@ async function runExporterLifecycle() {
     await makeTempDir();
 
     const browser = await puppeteer.launch({
-        headless: true,
+        headless: false,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -180,42 +180,46 @@ async function runExporterLifecycle() {
     process.exit(0);
 }
 
-// File Watcher Component (Optimized for MongoDB Parser handoff)
+// File Watcher Component (Handles base folder export and subdirectory tracking)
 async function initFileWatcher() {
-    // Watch the subdirectory, ignoring already processed or active worker files
+    // Watch the subdirectory, ignoring temp streams and our static tracking file
     const watcher = chokidar.watch(tempDownloadPath, { 
-        ignored: [/\\.tmp$/g, /\\.crdownload$/g], 
+        ignored: [/\\.crdownload$/g, /\\.tmp$/g, /_last\\.csv$/], 
         persistent: true 
     });
     
     watcher.on('add', async function(filePath) {
-        // Skip files that are not the raw initial download from Chrome
-        if (filePath.endsWith('.crdownload') || filePath.endsWith('.tmp') || path.basename(filePath).startsWith('smax_report_')) return;
+        // Safe check: ignore temp files or files already modified by this watcher
+        const baseName = path.basename(filePath);
+        if (filePath.endsWith('.crdownload') || filePath.endsWith('.tmp') || baseName.endsWith('_last.csv')) return;
 
-        logger.info(`File download event intercepted: ${filePath}`);
+        logger.info(`File download event intercepted in subdirectory: ${filePath}`);
         
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const finalName = `smax_report_${config.DURATION}d_${config.REPORT_TAG}_${timestamp}.csv`;
         
-        // Target paths within the subdirectory
-        const stagePath = path.join(tempDownloadPath, `${finalName}.tmp`);
-        const destPath = path.join(tempDownloadPath, finalName);
+        // UPDATED: Moved duration right after report tag and removed the "d"
+        const finalName = `${config.REPORT_TAG}_${config.DURATION}_smax_report_${timestamp}.csv`;
+        
+        // Target paths
+        const baseDestPath = path.join(config.DOWNLOAD_PATH, finalName);
+        const baseStagePath = path.join(config.DOWNLOAD_PATH, `${finalName}.tmp`);
+        const subDirLastPath = path.join(tempDownloadPath, `${config.REPORT_TAG}_last.csv`);
 
         try {
-            // 1. Copy the raw file to a hidden .tmp staging file so Mongo parser ignores it while writing
-            logger.info(`Staging copy file stream: ${stagePath}`);
-            await fsPromises.copyFile(filePath, stagePath);
-            
-            // 2. Remove the original raw browser download file
-            await fsPromises.unlink(filePath); 
+            // 1. Save the static tracking copy to the subdirectory
+            logger.info(`Creating persistent tracking copy in subdirectory: ${subDirLastPath}`);
+            await copyFile(filePath, subDirLastPath);
 
-            // 3. Atomically rename the staging file to the final .csv name
-            // This guarantees smreportparser never catches a half-written file!
-            await fsPromises.rename(stagePath, destPath);
-            logger.info(`File atomic handoff ready for Mongo parser: ${destPath}`);
+            // 2. Use the original moveFile logic to place it in the base folder
+            // This safely generates a new inode so smreportparser sees it cleanly!
+            logger.info(`Moving unique export file to base directory: ${baseDestPath}`);
+            await moveFile(filePath, baseDestPath);
+
+            logger.info(`File pipeline complete. Clean handoff ready in base volume: ${baseDestPath}`);
         } catch (err) {
-            logger.error(`Failed during parser handoff staging operations: ${err.message}`);
+            logger.error(`Failed renaming operations on targeted output path: ${err.message}`);
         }
+
     });
 }
 
@@ -224,3 +228,29 @@ async function initFileWatcher() {
     await initFileWatcher();
     await runExporterLifecycle();
 })();
+
+async function moveFile(oldname, newname) {
+  logger.debug(`Moving file ${oldname} to ${newname}`);
+  try {
+    await fsPromises.rename(oldname, newname);
+    logger.debug('File move complete.');
+    fileMoved = true;
+  } catch (e) {
+    logger.error('Throwing error from moveFile()');
+    throw e;
+  }
+}
+
+
+async function copyFile(oldname, newname) {
+  logger.debug(`Copying file ${oldname} to ${newname}`);
+  try {
+    await fsPromises.copyFile(oldname, newname);
+    logger.debug('File copy complete.');
+    fileCopied = true;
+  } catch (e) {
+    logger.error('Throwing error from copyFile()');
+    throw e;
+  }
+}
+
